@@ -1,0 +1,575 @@
+//
+//   ESP32 firmware to capture data from Easun/ISolar SMT-6.6kW and broadcast to
+//   MQTT using code and documentation at
+//   https://github.com/ljulina/esphome-easun-smt-iii
+//
+
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+#include <WiFi.h>
+
+#include <ArduinoOTA.h>
+#include <PubSubClient.h> // MQTT client
+
+#define PMR_RX_PIN 16
+#define PMR_TX_PIN 17
+
+const char *ssid = "******";       // Change this to your WiFi SSID
+const char *password = "******"; // Change this to your WiFi password
+
+String devicename = "Easun";
+
+// stay alive
+bool stay_alive = false;
+
+// MQTT
+char conf_server_ip[32] = "xxx.xxx.xxx.xxx";
+
+#define MAX_MSG 50
+char msg[MAX_MSG + 1];
+
+WiFiClient espClient;
+PubSubClient mqttclient (conf_server_ip, 1883, NULL, espClient);
+
+String stringOne;
+
+String HPV = "\x48\x50\x56\x0D";           // PV Values
+String HOP = "\x48\x4F\x50\x0D";           // Output Values
+String HBAT = "\x48\x42\x41\x54\x0D";      // Battery values
+String HGEN = "\x48\x47\x45\x4E\x0D";      // Energy Generation Counters
+String HTEMP = "\x48\x54\x45\x4D\x50\x0D"; // Temperatures And Fan Values
+
+enum request_type
+{
+  rq_HPV,
+  rq_HOP,
+  rq_HBAT,
+  rq_HGEN,
+  rq_HTEMP
+};
+
+request_type expectedResponse;
+
+void
+reconnect ()
+{
+  // Loop until we're reconnected
+  if (!mqttclient.connected ())
+    {
+      Serial.print ("Attempting MQTT connection...");
+      // Create a random client ID
+      String clientId = "ESP32Client-";
+      clientId += String (random (0xffff), HEX);
+      // Attempt to connect
+      if (mqttclient.connect (clientId.c_str ()))
+        {
+          Serial.println ("connected");
+        }
+      else
+        {
+          Serial.print ("failed, rc=");
+          Serial.print (mqttclient.state ());
+          Serial.println (" ");
+          // should we retry ???
+          // Wait 5 seconds before retrying
+          // delay(5000);
+          // timerId = timer.setTimeout(5000,reconnect);
+        }
+    }
+}
+
+void
+publish_float (const char *topic, float var)
+{
+  char buf[11];
+  snprintf (buf, 10, "%3.1f", var);
+  mqttclient.publish (topic, buf);
+}
+
+void
+publish_float4 (const char *topic, float var)
+{
+  char buf[11];
+  snprintf (buf, 10, "%3.4f", var);
+  mqttclient.publish (topic, buf);
+}
+
+void
+setup ()
+{
+  Serial.begin (115200);
+  Serial2.begin (2400, SERIAL_8N1, PMR_RX_PIN, PMR_TX_PIN);
+  Serial2.setTimeout (10000);
+
+  // We start by connecting to a WiFi network
+
+  Serial.println ();
+  Serial.println ("******************************************************");
+  Serial.print ("Connecting to ");
+  Serial.println (ssid);
+
+  WiFi.begin (ssid, password);
+
+  while (WiFi.status () != WL_CONNECTED)
+    {
+      delay (500);
+      Serial.print (".");
+    }
+
+  Serial.println ("");
+  Serial.println ("WiFi connected");
+  Serial.println ("IP address: ");
+  Serial.println (WiFi.localIP ());
+
+  if (!mqttclient.connected ())
+    {
+      reconnect ();
+    }
+
+  ArduinoOTA.setHostname (devicename.c_str ());
+  ArduinoOTA.begin ();
+}
+
+void
+trim_trailing_dots (std::string &s)
+{
+  while (!s.empty () && s.back () == '.')
+    {
+      s.pop_back ();
+    }
+}
+
+void
+split_paren_line (const std::string &printable, std::vector<std::string> &parts)
+{
+  parts.clear ();
+  std::string current;
+  for (char c : printable)
+    {
+      if (c == ' ' || c == '(' || c == ')')
+        {
+          if (!current.empty ())
+            {
+              parts.push_back (current);
+              current.clear ();
+            }
+        }
+      else
+        {
+          current += c;
+        }
+    }
+  if (!current.empty ())
+    {
+      parts.push_back (current);
+    }
+  for (auto &part : parts)
+    {
+      trim_trailing_dots (part);
+    }
+}
+
+bool
+field_has_leading_digits (const std::string &s, size_t count)
+{
+  if (s.size () < count)
+    {
+      return false;
+    }
+  for (size_t i = 0; i < count; i++)
+    {
+      if (!isdigit (static_cast<unsigned char> (s[i])))
+        {
+          return false;
+        }
+    }
+  return true;
+}
+
+bool
+parse_float_field (const std::string &s, float *value)
+{
+  if (value == nullptr || s.empty ())
+    {
+      return false;
+    }
+  char *end = nullptr;
+  const float parsed = strtof (s.c_str (), &end);
+  if (end == s.c_str () || (end != nullptr && *end != '\0'))
+    {
+      return false;
+    }
+  *value = parsed;
+  return true;
+}
+void
+process_hop_line_ (const std::vector<std::string> &parts)
+{
+  if (parts.size () < 9)
+    {
+      Serial.println ("HOP: insufficient fields");
+      return;
+    }
+  float output_voltage;
+  float output_frequency;
+  float output_apparent_power;
+  float output_active_power;
+  float load_percentage;
+  float bus_voltage;
+  float rated_power;
+  float output_current;
+  if (!parse_float_field (parts[0], &output_voltage)
+      || !parse_float_field (parts[1], &output_frequency)
+      || !parse_float_field (parts[2], &output_apparent_power)
+      || !parse_float_field (parts[3], &output_active_power)
+      || !parse_float_field (parts[4], &load_percentage)
+      || !parse_float_field (parts[5], &bus_voltage)
+      || !parse_float_field (parts[6], &rated_power)
+      || !parse_float_field (parts[7], &output_current))
+    {
+      // record_dropped_response_("HOP: non-numeric field in numeric
+      // payload, dropping line");
+      return;
+    }
+  publish_float ("/easun/hop/outputpower", output_active_power);
+
+  if (output_voltage < 0.0f || output_voltage > 300.0f
+      || output_frequency < 0.0f
+      || (output_frequency > 0.0f
+          && (output_frequency < 40.0f || output_frequency > 70.0f))
+      || output_apparent_power < 0.0f || output_active_power < 0.0f
+      || load_percentage < 0.0f || load_percentage > 250.0f
+      || bus_voltage < 0.0f || bus_voltage > 600.0f || rated_power < 100.0f
+      || rated_power > 50000.0f || output_current < 0.0f
+      || output_apparent_power > rated_power * 2.0f
+      || output_active_power > rated_power * 2.0f)
+    {
+      char reason[160];
+      snprintf (reason, sizeof (reason),
+                "HOP: implausible values (U=%.1fV f=%.1fHz P=%.0fW S=%.0fVA "
+                "load=%.0f%% bus=%.1fV rated=%.0f), "
+                "dropping line",
+                output_voltage, output_frequency, output_active_power,
+                output_apparent_power, load_percentage, bus_voltage,
+                rated_power);
+      // record_dropped_response_(reason);
+      return;
+    }
+
+  Serial.printf ("HOP: values (U=%.1fV f=%.1fHz P=%.0fW S=%.0fVA load=%.0f%% "
+                 "bus=%.1fV rated=%.0f)\r ",
+                 output_voltage, output_frequency, output_active_power,
+                 output_apparent_power, load_percentage, bus_voltage,
+                 rated_power);
+}
+
+void
+process_hpv_line_ (const std::vector<std::string> &parts)
+{
+  if (parts.size () < 9)
+    {
+      Serial.println ("HPV: insufficient fields");
+      return;
+    }
+  float pv_voltage;
+  float pv_current;
+  float pv_power;
+
+  if (!parse_float_field (parts[0], &pv_voltage)
+      || !parse_float_field (parts[1], &pv_current)
+      || !parse_float_field (parts[2], &pv_power))
+    {
+      // record_dropped_response_("HOP: non-numeric field in numeric
+      // payload, dropping line");
+      return;
+    }
+  Serial.printf ("HPV: values (V=%.1fV G=%.1A P=%.0fW )\r ", pv_voltage,
+                 pv_current, pv_power);
+  publish_float ("/easun/hpv/PVpower", pv_power);
+  /*
+| 0 | PV Voltage | V |
+| 1 | PV Current | A |
+| 2 | PV Power | W |
+| 3 | Unknown | Possibly accumulated or secondary PV value |
+| 4 | Unknown | Possibly accumulated or secondary PV value |
+| 5 | PV Operating Mode | Tentative enum |
+| 6 | PV Max Voltage | V |
+| 7 | PV Temperature | Celsius, tentative |
+| 8 | PV Max Power | W |
+  */
+}
+
+void
+process_hgen_line_ (const std::vector<std::string> &parts)
+{
+  // A valid HGEN response starts with a date (YYMMDD) followed by a time
+  // (HH:MM). If the structure does not match, the line is a desynchronized or
+  // merged response from another command. Publishing it would push foreign
+  // values into the PV energy counters (e.g. the date 260617, or CT constants
+  // like 2048 from HEEP3), so drop it instead.
+  if (parts.size () < 6 || !field_has_leading_digits (parts[0], 6)
+      || parts[1].find (':') == std::string::npos)
+    {
+
+      return;
+    }
+  float genDay;
+  float genMonth;
+  float genYear;
+  if (parts.size () > 1)
+    {
+      const std::string &date = parts[0];
+      const std::string &time = parts[1];
+      if (date.size () >= 6 && isdigit (static_cast<unsigned char> (date[0]))
+          && isdigit (static_cast<unsigned char> (date[1]))
+          && isdigit (static_cast<unsigned char> (date[2]))
+          && isdigit (static_cast<unsigned char> (date[3]))
+          && isdigit (static_cast<unsigned char> (date[4]))
+          && isdigit (static_cast<unsigned char> (date[5]))
+          && time.size () >= 5)
+        {
+          char formatted[20];
+          snprintf (formatted, sizeof (formatted), "20%c%c-%c%c-%c%c %.*s",
+                    date[0], date[1], date[2], date[3], date[4], date[5], 5,
+                    time.c_str ());
+          // system_time_text_sensor_->publish_state(formatted);
+        }
+      else
+        {
+          //  system_time_text_sensor_->publish_state(date + " " + time);
+        }
+      if (!parse_float_field (parts[2], &genDay)
+          || !parse_float_field (parts[3], &genMonth)
+          || !parse_float_field (parts[4], &genYear))
+        {
+          // record_dropped_response_("HOP: non-numeric field in numeric
+          // payload, dropping line");
+          return;
+        }
+      Serial.printf ("HGEN: values (D=%.1fkWh M=%.1fkWh Y=%.2fkWh )\r", genDay,
+                     genMonth, genYear);
+      publish_float ("/easun/genDay", genDay);
+      publish_float ("/easun/genMonth", genMonth);
+      publish_float ("/easun/genYear", genYear);
+    }
+  /*
+| Index | Meaning | Notes |
+| --- | --- | --- |
+| 0 | Date | `YYMMDD` |
+| 1 | Time | `HH:MM` |
+| 2 | Daily Power Generation | Total PV, unit likely kWh |
+| 3 | Monthly Power Generation | Total PV, unit likely kWh |
+| 4 | Yearly Power Generation | Total PV, unit likely kWh |
+| 5 | Total Power Generation | Total PV, unit likely kWh |
+| 6 | Unknown | Flags / reserved |
+  */
+}
+
+void
+process_hbat_line_ (const std::vector<std::string> &parts)
+{
+  if (parts.size () < 8)
+    {
+      Serial.println ("HBAT: insufficient fields");
+      return;
+    }
+  float batV;
+  float batCap;
+  float batChg;
+  float batDisChg;
+
+  if (!parse_float_field (parts[1], &batV)
+      || !parse_float_field (parts[2], &batCap)
+      || !parse_float_field (parts[3], &batChg)
+      || !parse_float_field (parts[4], &batDisChg))
+    {
+      Serial.println (
+          "HBAT: non-numeric field in numeric payload, dropping line");
+      return;
+    }
+  publish_float ("/easun/hbat/batV", batV);
+  publish_float ("/easun/hbat/batCap", batCap);
+  publish_float ("/easun/hbat/batChg", batChg);
+  publish_float ("/easun/hbat/batDisChg", batDisChg);
+
+  /*
+  | Index | Meaning | Notes |
+  | --- | --- | --- |
+  | 0 | Battery Number In Series | Count |
+  | 1 | Battery Voltage | V |
+  | 2 | Battery Capacity | % |
+  | 3 | Battery Charging Current | A, tentative |
+  | 4 | Battery Discharging Current | A, tentative |
+  | 5 | DC Bus Voltage | V |
+  | 6 | Unknown | Composite value / flags |
+  | 7 | Unknown | Flags / reserved |
+  */
+}
+
+void
+process_line_ (const std::string &raw)
+{
+  std::string printable;
+  Serial.println (raw.c_str ());
+  printable.reserve (raw.size ());
+  for (char c : raw)
+    {
+      if (c >= 32 && c <= 126)
+        {
+          printable += c;
+        }
+    }
+
+  if (printable.empty () || printable[0] != '(')
+    {
+      return;
+    }
+
+  std::vector<std::string> parts;
+  split_paren_line (printable, parts);
+
+  switch (expectedResponse)
+    {
+    case rq_HOP:
+      process_hop_line_ (parts);
+      break;
+      /*
+    case rq_HGRID:
+      process_hgrid_line_(parts);
+      break;
+      */
+    case rq_HBAT:
+      process_hbat_line_ (parts);
+      break;
+    /*
+    case ExpectedResponse::HSTS:
+      process_hsts_line_(parts);
+      break;
+      */
+    case rq_HPV:
+      process_hpv_line_ (parts);
+      break;
+    case rq_HTEMP:
+      //  process_htemp_line_(parts);
+      break;
+    /*
+    case ExpectedResponse::HEEP1:
+      process_heep1_line_(parts);
+      break;
+    case ExpectedResponse::HBMS1:
+      process_hbms1_line_(parts);
+      break;
+      */
+    case rq_HGEN:
+      process_hgen_line_ (parts);
+      break;
+      /*
+      case ExpectedResponse::HPVB:
+        process_hpvb_line_(parts);
+        break;
+      case ExpectedResponse::HEEP2:
+        process_heep2_line_(parts);
+        break;
+      case ExpectedResponse::HIMSG1:
+        process_himsg1_line_(parts);
+        break;
+      case ExpectedResponse::HBMS2:
+        process_hbms2_line_(parts);
+        break;
+      case ExpectedResponse::HBMS3:
+        process_hbms3_line_(parts);
+        break;
+      case ExpectedResponse::HEEP3:
+        process_heep3_line_(parts);
+        break;
+      case ExpectedResponse::HSTS2:
+        process_hsts2_line_(parts);
+        break;
+      case ExpectedResponse::HCTMSG1:
+        process_hctmsg1_line_(parts);
+        break;
+      case ExpectedResponse::QPRTL:
+        process_qprtl_line_(parts);
+        break;
+      */
+    }
+}
+
+void
+loop ()
+{
+
+  ArduinoOTA.handle ();
+
+  Serial.println ("Sending command HOP");
+  expectedResponse = rq_HOP;
+  Serial2.print (HOP);
+  delay (2000);
+  if (Serial2.available ())
+    {
+      Serial.println ("Printing reply from inverter:");
+      stringOne = Serial2.readStringUntil ('\r');
+
+      std::string test = stringOne.c_str ();
+
+      process_line_ (test);
+      stringOne = "";
+    }
+
+  Serial.println ("Sending command HPV");
+  expectedResponse = rq_HPV;
+  Serial2.print (HPV);
+  delay (2000);
+  if (Serial2.available ())
+    {
+      Serial.println ("Printing reply from inverter:");
+      stringOne = Serial2.readStringUntil ('\r');
+
+      std::string test = stringOne.c_str ();
+
+      process_line_ (test);
+      stringOne = "";
+    }
+  if (!mqttclient.connected ())
+    {
+      reconnect ();
+    }
+
+  Serial.println ("Sending command HGEN");
+  expectedResponse = rq_HGEN;
+  Serial2.print (HGEN);
+  delay (2000);
+  if (Serial2.available ())
+    {
+      Serial.println ("Printing reply from inverter:");
+      stringOne = Serial2.readStringUntil ('\r');
+      std::string test = stringOne.c_str ();
+
+      process_line_ (test);
+      stringOne = "";
+    }
+  if (!mqttclient.connected ())
+    {
+      reconnect ();
+    }
+
+  Serial.println ("Sending command HBAT");
+  expectedResponse = rq_HBAT;
+  Serial2.print (HBAT);
+  delay (2000);
+  if (Serial2.available ())
+    {
+      Serial.println ("Printing reply from inverter:");
+      stringOne = Serial2.readStringUntil ('\r');
+      std::string test = stringOne.c_str ();
+
+      process_line_ (test);
+      stringOne = "";
+    }
+  if (!mqttclient.connected ())
+    {
+      reconnect ();
+    }
+  // Serial.println("client.loop");
+  mqttclient.loop ();
+}
